@@ -73,6 +73,8 @@ export type { SupervisorConfig } from "./agent/types";
 export * from "./tool";
 export * from "./tool/reasoning/index";
 export * from "./memory";
+// PostgresStorageAdapter temporarily disabled - needs type fixes to match StorageAdapter interface
+// export { PostgresStorageAdapter, createPostgresStorageAdapter, type PostgresStorageAdapterOptions } from "./memory/adapters/storage";
 export {
   createSensitiveNumberGuardrail,
   createEmailRedactorGuardrail,
@@ -307,6 +309,31 @@ export { convertUsage } from "./utils/usage-converter";
 
 // for backwards compatibility
 export { createAsyncIterableStream, type AsyncIterableStream } from "@voltagent/internal/utils";
+
+// Secure Configuration (cofre-local)
+export {
+  loadSecret,
+  tryLoadSecret,
+  loadSecrets,
+  loadAllSecrets,
+  applySecretsToEnv,
+  VoltAgentSecureConfig,
+  secureConfig,
+  SECRET_TO_ENV_MAP,
+} from "./config/secure-config";
+
+// Resilience - Circuit Breaker
+export {
+  CircuitBreaker,
+  CircuitBreakerRegistry,
+  CircuitBreakerOpenError,
+  CircuitState,
+  type CircuitBreakerOptions,
+  type CircuitBreakerStats,
+  createMcpCircuitBreaker,
+  createA2aCircuitBreaker,
+  createHttpCircuitBreaker,
+} from "./resilience/circuit-breaker";
 
 // Convenience re-exports from ai-sdk so apps need only @voltagent/core
 export { stepCountIs, hasToolCall } from "ai";

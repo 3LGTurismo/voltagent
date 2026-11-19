@@ -194,8 +194,9 @@ export class VoltAgent {
       if (options.checkDependencies !== false) {
         // Run dependency check in background to not block startup
         Promise.resolve().then(() => {
-          this.checkDependencies().catch(() => {
-            // Silently ignore errors
+          this.checkDependencies().catch((error) => {
+            // Log error but don't crash startup
+            this.logger.error("Dependency check failed", { error });
           });
         });
       }
