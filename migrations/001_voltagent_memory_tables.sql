@@ -34,9 +34,7 @@ CREATE TABLE IF NOT EXISTS voltagent_messages (
     conversation_id VARCHAR(255) NOT NULL REFERENCES voltagent_conversations(id) ON DELETE CASCADE,
     user_id VARCHAR(255) NOT NULL,
     role VARCHAR(50) NOT NULL,
-    content TEXT,
     parts JSONB,
-    annotations JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -61,16 +59,16 @@ CREATE INDEX IF NOT EXISTS idx_voltagent_working_memory_user_conversation
 
 -- 4. Workflow States Table
 -- ============================================================================
+-- state JSONB stores the full WorkflowStateEntry object (serialized)
+-- execution_id = WorkflowStateEntry.id
+-- workflow_id and status are indexed separately for fast queries
 CREATE TABLE IF NOT EXISTS voltagent_workflow_states (
     execution_id VARCHAR(255) PRIMARY KEY,
     workflow_id VARCHAR(255) NOT NULL,
     status VARCHAR(50) NOT NULL,
-    step_id VARCHAR(255),
     state JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    suspended_at TIMESTAMP WITH TIME ZONE,
-    resume_data JSONB
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_voltagent_workflow_states_workflow_id
@@ -82,19 +80,32 @@ CREATE INDEX IF NOT EXISTS idx_voltagent_workflow_states_user
 
 -- 5. Conversation Steps Table
 -- ============================================================================
+-- step_index = ConversationStepRecord.stepIndex
+-- step_type  = ConversationStepRecord.type (ConversationStepType enum)
+-- arguments, result, usage stored as JSONB
 CREATE TABLE IF NOT EXISTS voltagent_conversation_steps (
     id VARCHAR(255) PRIMARY KEY,
     conversation_id VARCHAR(255) NOT NULL REFERENCES voltagent_conversations(id) ON DELETE CASCADE,
     user_id VARCHAR(255) NOT NULL,
-    step_number INTEGER NOT NULL,
-    input JSONB NOT NULL,
-    output JSONB NOT NULL,
-    tool_calls JSONB,
+    agent_id VARCHAR(255) NOT NULL,
+    agent_name VARCHAR(255),
+    operation_id VARCHAR(255) NOT NULL,
+    step_index INTEGER NOT NULL,
+    step_type VARCHAR(50) NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    content TEXT,
+    arguments JSONB,
+    result JSONB,
+    usage JSONB,
+    sub_agent_id VARCHAR(255),
+    sub_agent_name VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_voltagent_conversation_steps_conversation
-    ON voltagent_conversation_steps(conversation_id, user_id, step_number);
+    ON voltagent_conversation_steps(conversation_id, user_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_voltagent_conversation_steps_operation
+    ON voltagent_conversation_steps(operation_id);
 
 -- 6. Users Table (for metadata)
 -- ============================================================================
@@ -117,9 +128,7 @@ CREATE OR REPLACE FUNCTION voltagent_get_conversation_with_messages(
     conversation_title VARCHAR(500),
     message_id VARCHAR(255),
     message_role VARCHAR(50),
-    message_content TEXT,
     message_parts JSONB,
-    message_annotations JSONB,
     message_created_at TIMESTAMP WITH TIME ZONE
 ) AS $$
 BEGIN
@@ -129,9 +138,7 @@ BEGIN
         c.title,
         m.id,
         m.role,
-        m.content,
         m.parts,
-        m.annotations,
         m.created_at
     FROM voltagent_conversations c
     LEFT JOIN voltagent_messages m
@@ -169,7 +176,7 @@ DECLARE
     v_deleted INTEGER;
 BEGIN
     DELETE FROM voltagent_workflow_states
-    WHERE status IN ('completed', 'failed', 'cancelled')
+    WHERE status IN ('completed', 'error', 'cancelled')
         AND updated_at < NOW() - (p_days || ' days')::INTERVAL;
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
     RETURN v_deleted;

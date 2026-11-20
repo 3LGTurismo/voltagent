@@ -10,18 +10,14 @@
  * - voltagent_workflow_states
  * - voltagent_working_memory
  * - voltagent_conversation_steps
- * - voltagent_users
  *
- * Requires migration to create these tables.
- *
- * NOTE: This adapter is temporarily disabled pending type fixes to match the
- * StorageAdapter interface. The types have significant mismatches that need
- * to be resolved before it can be enabled.
+ * Requires migration 001_voltagent_memory_tables.sql to create these tables.
  */
 
-import { randomUUID } from "@voltagent/internal/utils";
+import { randomUUID } from "node:crypto";
+import { safeStringify } from "@voltagent/internal/utils";
 import type { UIMessage } from "ai";
-import { Pool, type PoolConfig, QueryResult } from "pg";
+import { Pool, type PoolConfig } from "pg";
 import type { OperationContext } from "../../../agent/types";
 import { ConversationAlreadyExistsError, ConversationNotFoundError } from "../../errors";
 import type {
@@ -32,78 +28,66 @@ import type {
   GetConversationStepsOptions,
   GetMessagesOptions,
   StorageAdapter,
-  StoredUIMessage,
   WorkflowRunQuery,
   WorkflowStateEntry,
   WorkingMemoryScope,
 } from "../../types";
 
-interface _UserInfo {
-  id: string;
-  metadata?: Record<string, unknown>;
-  created_at: Date;
-  updated_at: Date;
-}
-
-function _areMetadataValuesEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true;
-  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null)
-    return false;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-    for (let i = 0; i < left.length; i++) {
-      if (!areMetadataValuesEqual(left[i], right[i])) return false;
-    }
-    return true;
-  }
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  if (leftKeys.length !== rightKeys.length) return false;
-  for (const key of leftKeys) {
-    if (!Object.prototype.hasOwnProperty.call(rightRecord, key)) return false;
-    if (!areMetadataValuesEqual(leftRecord[key], rightRecord[key])) return false;
-  }
-  return true;
-}
-
 function mapConversationRow(row: any): Conversation {
   return {
     id: row.id,
-    resourceId: row.resource_id,
-    title: row.title,
+    resourceId: row.resource_id ?? "",
+    title: row.title ?? "",
     userId: row.user_id,
     metadata: row.metadata ?? {},
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function _mapStoredMessage(row: any): StoredUIMessage {
-  return {
-    id: row.id,
-    conversationId: row.conversation_id,
-    userId: row.user_id,
-    role: row.role,
-    content: row.content,
-    parts: row.parts,
-    annotations: row.annotations,
-    createdAt: row.created_at,
+    createdAt: (row.created_at instanceof Date
+      ? row.created_at
+      : new Date(row.created_at)
+    ).toISOString(),
+    updatedAt: (row.updated_at instanceof Date
+      ? row.updated_at
+      : new Date(row.updated_at)
+    ).toISOString(),
   };
 }
 
 function mapWorkflowStateRow(row: any): WorkflowStateEntry {
+  const data = typeof row.state === "string" ? JSON.parse(row.state) : (row.state ?? {});
   return {
-    executionId: row.execution_id,
+    ...data,
+    id: row.execution_id,
     workflowId: row.workflow_id,
     status: row.status,
-    stepId: row.step_id,
-    state: row.state,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    suspendedAt: row.suspended_at,
-    resumeData: row.resume_data,
+    createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at : new Date(row.updated_at),
+  };
+}
+
+function mapConversationStepRow(row: any): ConversationStepRecord {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    userId: row.user_id,
+    agentId: row.agent_id,
+    agentName: row.agent_name ?? undefined,
+    operationId: row.operation_id,
+    stepIndex: row.step_index,
+    type: row.step_type,
+    role: row.role,
+    content: row.content ?? undefined,
+    arguments: row.arguments ?? undefined,
+    result: row.result ?? undefined,
+    usage: row.usage
+      ? typeof row.usage === "string"
+        ? JSON.parse(row.usage)
+        : row.usage
+      : undefined,
+    subAgentId: row.sub_agent_id ?? undefined,
+    subAgentName: row.sub_agent_name ?? undefined,
+    createdAt: (row.created_at instanceof Date
+      ? row.created_at
+      : new Date(row.created_at)
+    ).toISOString(),
   };
 }
 
@@ -151,26 +135,17 @@ export class PostgresStorageAdapter implements StorageAdapter {
     }
   }
 
-  /**
-   * Initialize the adapter - create tables if needed
-   */
   async initialize(): Promise<void> {
     if (this.initialized) return;
-
-    // Test connection
     const client = await this.pool.connect();
     try {
       await client.query("SELECT 1");
     } finally {
       client.release();
     }
-
     this.initialized = true;
   }
 
-  /**
-   * Get table name with prefix
-   */
   private table(name: string): string {
     return `${this.tablePrefix}${name}`;
   }
@@ -200,30 +175,22 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
       for (const message of messages) {
         const id = message.id ?? randomUUID();
-        const now = new Date();
-
         await client.query(
           `INSERT INTO ${this.table("messages")}
-            (id, conversation_id, user_id, role, content, parts, annotations, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (id) DO UPDATE SET
-             content = EXCLUDED.content,
-             parts = EXCLUDED.parts,
-             annotations = EXCLUDED.annotations`,
+            (id, conversation_id, user_id, role, parts, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (id) DO UPDATE SET parts = EXCLUDED.parts`,
           [
             id,
             conversationId,
             userId,
             message.role,
-            typeof message.content === "string" ? message.content : JSON.stringify(message.content),
-            message.parts ? JSON.stringify(message.parts) : null,
-            message.annotations ? JSON.stringify(message.annotations) : null,
-            now,
+            safeStringify(message.parts ?? []),
+            new Date(),
           ],
         );
       }
 
-      // Update conversation updated_at
       await client.query(
         `UPDATE ${this.table("conversations")} SET updated_at = $1 WHERE id = $2`,
         [new Date(), conversationId],
@@ -244,27 +211,52 @@ export class PostgresStorageAdapter implements StorageAdapter {
     options?: GetMessagesOptions,
     _context?: OperationContext,
   ): Promise<UIMessage<{ createdAt: Date }>[]> {
+    const conditions = ["user_id = $1", "conversation_id = $2"];
+    const params: unknown[] = [userId, conversationId];
+    let paramIndex = 3;
+
+    if (options?.roles && options.roles.length > 0) {
+      const rolePlaceholders = options.roles.map(() => `$${paramIndex++}`).join(", ");
+      conditions.push(`role IN (${rolePlaceholders})`);
+      params.push(...options.roles);
+    }
+    if (options?.before) {
+      conditions.push(`created_at < $${paramIndex++}`);
+      params.push(options.before);
+    }
+    if (options?.after) {
+      conditions.push(`created_at > $${paramIndex++}`);
+      params.push(options.after);
+    }
+
     const limit = options?.limit ?? 100;
-    const offset = options?.offset ?? 0;
-    const order = options?.order ?? "asc";
+    params.push(limit);
 
     const result = await this.pool.query(
-      `SELECT id, conversation_id, user_id, role, content, parts, annotations, created_at
+      `SELECT id, role, parts, created_at
        FROM ${this.table("messages")}
-       WHERE user_id = $1 AND conversation_id = $2
-       ORDER BY created_at ${order === "desc" ? "DESC" : "ASC"}
-       LIMIT $3 OFFSET $4`,
-      [userId, conversationId, limit, offset],
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY created_at ASC
+       LIMIT $${paramIndex}`,
+      params,
     );
 
-    return result.rows.map((row) => ({
-      id: row.id,
-      role: row.role,
-      content: row.content,
-      parts: row.parts ? JSON.parse(row.parts) : undefined,
-      annotations: row.annotations ? JSON.parse(row.annotations) : undefined,
-      createdAt: row.created_at,
-    }));
+    return result.rows.map((row) => {
+      const parts = row.parts
+        ? typeof row.parts === "string"
+          ? JSON.parse(row.parts)
+          : row.parts
+        : [];
+      const msg = {
+        id: row.id,
+        role: row.role,
+        parts,
+        metadata: {
+          createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+        },
+      };
+      return msg as unknown as UIMessage<{ createdAt: Date }>;
+    });
   }
 
   async clearMessages(
@@ -289,7 +281,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
     _context?: OperationContext,
   ): Promise<void> {
     if (messageIds.length === 0) return;
-
     const placeholders = messageIds.map((_, i) => `$${i + 3}`).join(", ");
     await this.pool.query(
       `DELETE FROM ${this.table("messages")}
@@ -303,9 +294,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   // ============================================================================
 
   async createConversation(input: CreateConversationInput): Promise<Conversation> {
-    const id = input.id ?? randomUUID();
     const now = new Date();
-
     try {
       const result = await this.pool.query(
         `INSERT INTO ${this.table("conversations")}
@@ -313,22 +302,18 @@ export class PostgresStorageAdapter implements StorageAdapter {
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
         [
-          id,
-          input.resourceId ?? null,
-          input.title ?? null,
+          input.id,
+          input.resourceId,
+          input.title,
           input.userId,
-          JSON.stringify(input.metadata ?? {}),
+          safeStringify(input.metadata ?? {}),
           now,
           now,
         ],
       );
-
       return mapConversationRow(result.rows[0]);
     } catch (error: any) {
-      if (error.code === "23505") {
-        // unique_violation
-        throw new ConversationAlreadyExistsError(id);
-      }
+      if (error.code === "23505") throw new ConversationAlreadyExistsError(input.id);
       throw error;
     }
   }
@@ -338,19 +323,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
       `SELECT * FROM ${this.table("conversations")} WHERE id = $1`,
       [id],
     );
-
     if (result.rows.length === 0) return null;
     return mapConversationRow(result.rows[0]);
   }
 
   async getConversations(resourceId: string): Promise<Conversation[]> {
     const result = await this.pool.query(
-      `SELECT * FROM ${this.table("conversations")}
-       WHERE resource_id = $1
-       ORDER BY updated_at DESC`,
+      `SELECT * FROM ${this.table("conversations")} WHERE resource_id = $1 ORDER BY updated_at DESC`,
       [resourceId],
     );
-
     return result.rows.map(mapConversationRow);
   }
 
@@ -360,22 +341,22 @@ export class PostgresStorageAdapter implements StorageAdapter {
   ): Promise<Conversation[]> {
     const limit = options?.limit ?? 50;
     const offset = options?.offset ?? 0;
-    const order = options?.order ?? "desc";
+    const orderBy = options?.orderBy ?? "updated_at";
+    const orderDir = options?.orderDirection ?? "DESC";
 
     const result = await this.pool.query(
       `SELECT * FROM ${this.table("conversations")}
        WHERE user_id = $1
-       ORDER BY updated_at ${order === "desc" ? "DESC" : "ASC"}
+       ORDER BY ${orderBy} ${orderDir}
        LIMIT $2 OFFSET $3`,
       [userId, limit, offset],
     );
-
     return result.rows.map(mapConversationRow);
   }
 
   async queryConversations(options: ConversationQueryOptions): Promise<Conversation[]> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (options.userId) {
@@ -386,36 +367,28 @@ export class PostgresStorageAdapter implements StorageAdapter {
       conditions.push(`resource_id = $${paramIndex++}`);
       params.push(options.resourceId);
     }
-    if (options.title) {
-      conditions.push(`title ILIKE $${paramIndex++}`);
-      params.push(`%${options.title}%`);
-    }
-    if (options.metadata) {
-      conditions.push(`metadata @> $${paramIndex++}`);
-      params.push(JSON.stringify(options.metadata));
-    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = options.limit ?? 50;
     const offset = options.offset ?? 0;
-    const order = options.order ?? "desc";
+    const orderBy = options.orderBy ?? "updated_at";
+    const orderDir = options.orderDirection ?? "DESC";
 
     params.push(limit, offset);
 
     const result = await this.pool.query(
       `SELECT * FROM ${this.table("conversations")}
        ${whereClause}
-       ORDER BY updated_at ${order === "desc" ? "DESC" : "ASC"}
+       ORDER BY ${orderBy} ${orderDir}
        LIMIT $${paramIndex++} OFFSET $${paramIndex}`,
       params,
     );
-
     return result.rows.map(mapConversationRow);
   }
 
   async countConversations(options: ConversationQueryOptions): Promise<number> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (options.userId) {
@@ -426,22 +399,12 @@ export class PostgresStorageAdapter implements StorageAdapter {
       conditions.push(`resource_id = $${paramIndex++}`);
       params.push(options.resourceId);
     }
-    if (options.title) {
-      conditions.push(`title ILIKE $${paramIndex++}`);
-      params.push(`%${options.title}%`);
-    }
-    if (options.metadata) {
-      conditions.push(`metadata @> $${paramIndex++}`);
-      params.push(JSON.stringify(options.metadata));
-    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-
     const result = await this.pool.query(
       `SELECT COUNT(*) FROM ${this.table("conversations")} ${whereClause}`,
       params,
     );
-
     return Number.parseInt(result.rows[0].count, 10);
   }
 
@@ -450,7 +413,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     updates: Partial<Omit<Conversation, "id" | "createdAt" | "updatedAt">>,
   ): Promise<Conversation> {
     const setParts: string[] = [];
-    const params: any[] = [id];
+    const params: unknown[] = [id];
     let paramIndex = 2;
 
     if (updates.resourceId !== undefined) {
@@ -463,7 +426,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     }
     if (updates.metadata !== undefined) {
       setParts.push(`metadata = $${paramIndex++}`);
-      params.push(JSON.stringify(updates.metadata));
+      params.push(safeStringify(updates.metadata));
     }
 
     if (setParts.length === 0) {
@@ -476,14 +439,12 @@ export class PostgresStorageAdapter implements StorageAdapter {
     params.push(new Date());
 
     const result = await this.pool.query(
-      `UPDATE ${this.table("conversations")} SET ${setParts.join(", ")} WHERE id = $1 RETURNING *`,
+      `UPDATE ${this.table("conversations")}
+       SET ${setParts.join(", ")}
+       WHERE id = $1 RETURNING *`,
       params,
     );
-
-    if (result.rows.length === 0) {
-      throw new ConversationNotFoundError(id);
-    }
-
+    if (result.rows.length === 0) throw new ConversationNotFoundError(id);
     return mapConversationRow(result.rows[0]);
   }
 
@@ -491,13 +452,8 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-
-      // Delete messages first (foreign key)
       await client.query(`DELETE FROM ${this.table("messages")} WHERE conversation_id = $1`, [id]);
-
-      // Delete conversation
       await client.query(`DELETE FROM ${this.table("conversations")} WHERE id = $1`, [id]);
-
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -507,34 +463,45 @@ export class PostgresStorageAdapter implements StorageAdapter {
     }
   }
 
+  // ============================================================================
+  // Conversation Steps
+  // ============================================================================
+
   async saveConversationSteps(steps: ConversationStepRecord[]): Promise<void> {
     if (steps.length === 0) return;
-
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-
       for (const step of steps) {
         await client.query(
           `INSERT INTO ${this.table("conversation_steps")}
-            (id, conversation_id, user_id, step_number, input, output, tool_calls, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (id, conversation_id, user_id, agent_id, agent_name, operation_id,
+             step_index, step_type, role, content, arguments, result, usage,
+             sub_agent_id, sub_agent_name, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
            ON CONFLICT (id) DO UPDATE SET
-             output = EXCLUDED.output,
-             tool_calls = EXCLUDED.tool_calls`,
+             result = EXCLUDED.result,
+             usage = EXCLUDED.usage`,
           [
             step.id,
             step.conversationId,
             step.userId,
-            step.stepNumber,
-            JSON.stringify(step.input),
-            JSON.stringify(step.output),
-            step.toolCalls ? JSON.stringify(step.toolCalls) : null,
+            step.agentId,
+            step.agentName ?? null,
+            step.operationId,
+            step.stepIndex,
+            step.type,
+            step.role,
+            step.content ?? null,
+            step.arguments ? safeStringify(step.arguments) : null,
+            step.result ? safeStringify(step.result) : null,
+            step.usage ? safeStringify(step.usage) : null,
+            step.subAgentId ?? null,
+            step.subAgentName ?? null,
             step.createdAt,
           ],
         );
       }
-
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -549,28 +516,26 @@ export class PostgresStorageAdapter implements StorageAdapter {
     conversationId: string,
     options?: GetConversationStepsOptions,
   ): Promise<ConversationStepRecord[]> {
-    const limit = options?.limit ?? 50;
-    const offset = options?.offset ?? 0;
-    const order = options?.order ?? "asc";
+    const conditions = ["user_id = $1", "conversation_id = $2"];
+    const params: unknown[] = [userId, conversationId];
+    let paramIndex = 3;
+
+    if (options?.operationId) {
+      conditions.push(`operation_id = $${paramIndex++}`);
+      params.push(options.operationId);
+    }
+
+    const limitClause = options?.limit ? `LIMIT $${paramIndex}` : "";
+    if (options?.limit) params.push(options.limit);
 
     const result = await this.pool.query(
       `SELECT * FROM ${this.table("conversation_steps")}
-       WHERE user_id = $1 AND conversation_id = $2
-       ORDER BY step_number ${order === "desc" ? "DESC" : "ASC"}
-       LIMIT $3 OFFSET $4`,
-      [userId, conversationId, limit, offset],
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY step_index ASC
+       ${limitClause}`,
+      params,
     );
-
-    return result.rows.map((row) => ({
-      id: row.id,
-      conversationId: row.conversation_id,
-      userId: row.user_id,
-      stepNumber: row.step_number,
-      input: JSON.parse(row.input),
-      output: JSON.parse(row.output),
-      toolCalls: row.tool_calls ? JSON.parse(row.tool_calls) : undefined,
-      createdAt: row.created_at,
-    }));
+    return result.rows.map(mapConversationStepRow);
   }
 
   // ============================================================================
@@ -583,7 +548,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
     scope: WorkingMemoryScope;
   }): Promise<string | null> {
     const { conversationId, userId, scope } = params;
-
     if (!userId && !conversationId) return null;
 
     const result = await this.pool.query(
@@ -591,7 +555,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
        WHERE scope = $1 AND user_id = $2 AND conversation_id = $3`,
       [scope, userId ?? null, conversationId ?? null],
     );
-
     if (result.rows.length === 0) return null;
     return result.rows[0].content;
   }
@@ -603,7 +566,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
     scope: WorkingMemoryScope;
   }): Promise<void> {
     const { conversationId, userId, content, scope } = params;
-
     if (!userId && !conversationId) return;
 
     await this.pool.query(
@@ -623,7 +585,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
     scope: WorkingMemoryScope;
   }): Promise<void> {
     const { conversationId, userId, scope } = params;
-
     if (!userId && !conversationId) return;
 
     await this.pool.query(
@@ -642,14 +603,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       `SELECT * FROM ${this.table("workflow_states")} WHERE execution_id = $1`,
       [executionId],
     );
-
     if (result.rows.length === 0) return null;
     return mapWorkflowStateRow(result.rows[0]);
   }
 
   async queryWorkflowRuns(query: WorkflowRunQuery): Promise<WorkflowStateEntry[]> {
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
     let paramIndex = 1;
 
     if (query.workflowId) {
@@ -668,7 +628,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = query.limit ?? 50;
     const offset = query.offset ?? 0;
-
     params.push(limit, offset);
 
     const result = await this.pool.query(
@@ -678,33 +637,26 @@ export class PostgresStorageAdapter implements StorageAdapter {
        LIMIT $${paramIndex++} OFFSET $${paramIndex}`,
       params,
     );
-
     return result.rows.map(mapWorkflowStateRow);
   }
 
   async setWorkflowState(executionId: string, state: WorkflowStateEntry): Promise<void> {
     await this.pool.query(
       `INSERT INTO ${this.table("workflow_states")}
-        (execution_id, workflow_id, status, step_id, state, created_at, updated_at, suspended_at, resume_data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (execution_id, workflow_id, status, state, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (execution_id) DO UPDATE SET
          workflow_id = EXCLUDED.workflow_id,
          status = EXCLUDED.status,
-         step_id = EXCLUDED.step_id,
          state = EXCLUDED.state,
-         updated_at = EXCLUDED.updated_at,
-         suspended_at = EXCLUDED.suspended_at,
-         resume_data = EXCLUDED.resume_data`,
+         updated_at = EXCLUDED.updated_at`,
       [
         executionId,
         state.workflowId,
         state.status,
-        state.stepId ?? null,
-        JSON.stringify(state.state),
+        safeStringify(state),
         state.createdAt,
         state.updatedAt,
-        state.suspendedAt ?? null,
-        state.resumeData ? JSON.stringify(state.resumeData) : null,
       ],
     );
   }
@@ -713,54 +665,19 @@ export class PostgresStorageAdapter implements StorageAdapter {
     executionId: string,
     updates: Partial<WorkflowStateEntry>,
   ): Promise<void> {
-    const setParts: string[] = [];
-    const params: any[] = [executionId];
-    let paramIndex = 2;
-
-    if (updates.workflowId !== undefined) {
-      setParts.push(`workflow_id = $${paramIndex++}`);
-      params.push(updates.workflowId);
-    }
-    if (updates.status !== undefined) {
-      setParts.push(`status = $${paramIndex++}`);
-      params.push(updates.status);
-    }
-    if (updates.stepId !== undefined) {
-      setParts.push(`step_id = $${paramIndex++}`);
-      params.push(updates.stepId);
-    }
-    if (updates.state !== undefined) {
-      setParts.push(`state = $${paramIndex++}`);
-      params.push(JSON.stringify(updates.state));
-    }
-    if (updates.suspendedAt !== undefined) {
-      setParts.push(`suspended_at = $${paramIndex++}`);
-      params.push(updates.suspendedAt);
-    }
-    if (updates.resumeData !== undefined) {
-      setParts.push(`resume_data = $${paramIndex++}`);
-      params.push(updates.resumeData ? JSON.stringify(updates.resumeData) : null);
-    }
-
-    if (setParts.length === 0) return;
-
-    setParts.push(`updated_at = $${paramIndex++}`);
-    params.push(new Date());
-
-    await this.pool.query(
-      `UPDATE ${this.table("workflow_states")} SET ${setParts.join(", ")} WHERE execution_id = $1`,
-      params,
-    );
+    const current = await this.getWorkflowState(executionId);
+    if (!current) return;
+    const updated: WorkflowStateEntry = { ...current, ...updates, updatedAt: new Date() };
+    await this.setWorkflowState(executionId, updated);
   }
 
   async getSuspendedWorkflowStates(workflowId: string): Promise<WorkflowStateEntry[]> {
     const result = await this.pool.query(
       `SELECT * FROM ${this.table("workflow_states")}
        WHERE workflow_id = $1 AND status = 'suspended'
-       ORDER BY suspended_at DESC`,
+       ORDER BY updated_at DESC`,
       [workflowId],
     );
-
     return result.rows.map(mapWorkflowStateRow);
   }
 
